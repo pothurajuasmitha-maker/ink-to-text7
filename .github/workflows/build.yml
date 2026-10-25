@@ -1,0 +1,1033 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts << 'EOF_INK'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "InkToText"
+          include(":app")
+          EOF_INK
+          cat > build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_INK
+          cat > gradle.properties << 'EOF_INK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_INK
+          mkdir -p app
+          cat > app/build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.inktotext"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.inktotext"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
+          }
+          EOF_INK
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'EOF_INK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="InkToText"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_INK
+          mkdir -p app/src/main/java/com/example/inktotext
+          cat > app/src/main/java/com/example/inktotext/MainActivity.kt << 'EOF_INK'
+          package com.example.inktotext
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.common.model.RemoteModelManager
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognition
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModel
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModelIdentifier
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizer
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
+          import com.google.mlkit.vision.digitalink.Ink
+
+          // Full-screen board: pen strokes, and recognized text/maths drawn in the SAME place
+          class DrawingView(context: Context) : View(context) {
+              class TextItem(
+                  val text: String, val copy: String, val cx: Float, val baseline: Float,
+                  val size: Float, val color: Int, val sup: Boolean
+              ) { var group = 0 }
+
+              class LineItem(
+                  val x1: Float, val y1: Float, val x2: Float, val y2: Float, val color: Int
+              ) { var group = 0 }
+
+              // One converted line of writing, remembered for Copy/Save
+              class Group(val copy: String, val y: Float, val x0: Float, val size: Float, val count: Int)
+
+              class PStroke(val stroke: Ink.Stroke, val path: Path, val color: Int)
+
+              var penColor = Color.BLACK
+              var eraser = false
+              private val eraseRadius = 40f
+
+              private val inkPaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val linePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 6f; isAntiAlias = true
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private val textPaint = Paint().apply {
+                  isAntiAlias = true; typeface = Typeface.SANS_SERIF; textAlign = Paint.Align.CENTER
+              }
+              private var curPath = Path()
+              private var curColor = Color.BLACK
+              private var strokeBuilder: Ink.Stroke.Builder? = null
+
+              val pending = mutableListOf<PStroke>()           // handwriting not yet converted
+              private val items = mutableListOf<TextItem>()    // converted text
+              private val lineItems = mutableListOf<LineItem>() // fraction bars, root signs
+              private val groups = HashMap<Int, Group>()
+
+              var onStrokeFinished: (() -> Unit)? = null
+              var onStrokeStarted: (() -> Unit)? = null
+
+              init { setBackgroundColor(Color.WHITE) }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (p in pending) { inkPaint.color = p.color; canvas.drawPath(p.path, inkPaint) }
+                  inkPaint.color = curColor
+                  canvas.drawPath(curPath, inkPaint)
+                  for (ln in lineItems) {
+                      linePaint.color = ln.color
+                      canvas.drawLine(ln.x1, ln.y1, ln.x2, ln.y2, linePaint)
+                  }
+                  for (ti in items) {
+                      textPaint.color = ti.color
+                      textPaint.textSize = ti.size
+                      canvas.drawText(ti.text, ti.cx, ti.baseline, textPaint)
+                  }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x; val y = e.y; val t = SystemClock.uptimeMillis()
+
+                  if (eraser) {
+                      if (e.action == MotionEvent.ACTION_DOWN || e.action == MotionEvent.ACTION_MOVE) {
+                          erase(x, y); invalidate()
+                      }
+                      return true
+                  }
+
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          onStrokeStarted?.invoke()
+                          curColor = penColor
+                          curPath = Path().also { it.moveTo(x, y) }
+                          strokeBuilder = Ink.Stroke.builder().also {
+                              it.addPoint(Ink.Point.create(x, y, t))
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                          strokeBuilder?.let { pending.add(PStroke(it.build(), curPath, curColor)) }
+                          curPath = Path()
+                          strokeBuilder = null
+                          onStrokeFinished?.invoke()
+                      }
+                      else -> return false
+                  }
+                  invalidate()
+                  return true
+              }
+
+              private fun distToSegment(px: Float, py: Float, ln: LineItem): Float {
+                  val dx = ln.x2 - ln.x1; val dy = ln.y2 - ln.y1
+                  val len2 = dx * dx + dy * dy
+                  var t = if (len2 == 0f) 0f else ((px - ln.x1) * dx + (py - ln.y1) * dy) / len2
+                  t = t.coerceIn(0f, 1f)
+                  val cx = ln.x1 + t * dx; val cy = ln.y1 + t * dy
+                  return Math.hypot((px - cx).toDouble(), (py - cy).toDouble()).toFloat()
+              }
+
+              // Eraser: removes handwriting, converted text and lines under the finger
+              private fun erase(x: Float, y: Float) {
+                  pending.removeAll { p ->
+                      p.stroke.points.any {
+                          Math.hypot((it.x - x).toDouble(), (it.y - y).toDouble()) < eraseRadius
+                      }
+                  }
+                  lineItems.removeAll { ln -> distToSegment(x, y, ln) < eraseRadius }
+                  items.removeAll { item ->
+                      textPaint.textSize = item.size
+                      val w = textPaint.measureText(item.text) / 2 + eraseRadius
+                      x in (item.cx - w)..(item.cx + w) &&
+                              y in (item.baseline - item.size - eraseRadius / 2)..(item.baseline + item.size * 0.3f + eraseRadius / 2)
+                  }
+              }
+
+              // Replace the handwritten strokes in `done` by recognized text
+              fun commit(
+                  done: List<PStroke>, newItems: List<TextItem>,
+                  newLines: List<LineItem>, newGroups: Map<Int, Group>
+              ) {
+                  pending.removeAll { p -> done.any { it === p } }
+                  items.addAll(newItems)
+                  lineItems.addAll(newLines)
+                  groups.putAll(newGroups)
+                  invalidate()
+              }
+
+              fun clearAll() {
+                  pending.clear(); items.clear(); lineItems.clear(); groups.clear()
+                  curPath = Path(); strokeBuilder = null
+                  invalidate()
+              }
+
+              fun toBitmap(): Bitmap {
+                  val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                  draw(Canvas(bmp))
+                  return bmp
+              }
+
+              // All converted text line by line: (a)/(b), √(x), x² style
+              fun plainText(): String {
+                  class E(val y: Float, val x0: Float, val size: Float, val text: String)
+                  val entries = mutableListOf<E>()
+                  for ((g, list) in items.groupBy { it.group }) {
+                      val info = groups[g]
+                      if (info != null && info.count == list.size) {
+                          entries.add(E(info.y, info.x0, info.size, info.copy))
+                      } else {
+                          // partly erased: fall back to remaining characters
+                          val normals = list.filter { !it.sup }
+                          val ys = (if (normals.isEmpty()) list else normals).map { it.baseline }
+                          entries.add(E(ys.average().toFloat(), list.minOf { it.cx }, list[0].size,
+                              list.sortedBy { it.cx }.joinToString("") { it.copy }))
+                      }
+                  }
+                  val lines = mutableListOf<MutableList<E>>()
+                  for (e in entries.sortedBy { it.y }) {
+                      val ln = lines.firstOrNull { Math.abs(it[0].y - e.y) < e.size * 0.6f }
+                      if (ln != null) ln.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.joinToString("\n") { ln ->
+                      ln.sortedBy { it.x0 }.joinToString("") { it.text }
+                  }
+              }
+          }
+
+          // Small calculator: + - * / ^ ( ) sqrt( ), implicit multiplication like 2(3+4)
+          private class Parser(val s: String) {
+              var i = 0
+              private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+
+              fun parse(): Double {
+                  val v = expr()
+                  if (i != s.length) throw IllegalArgumentException()
+                  return v
+              }
+
+              private fun expr(): Double {
+                  var v = term()
+                  while (peek() == '+' || peek() == '-') {
+                      val op = s[i++]
+                      val r = term()
+                      v = if (op == '+') v + r else v - r
+                  }
+                  return v
+              }
+
+              private fun term(): Double {
+                  var v = power()
+                  while (true) {
+                      val c = peek()
+                      if (c == '*') { i++; v *= power() }
+                      else if (c == '/') { i++; v /= power() }
+                      else if (c == '(' || c == 's' || c.isDigit() || c == '.') v *= power()
+                      else break
+                  }
+                  return v
+              }
+
+              private fun power(): Double {
+                  val b = unary()
+                  if (peek() == '^') { i++; return Math.pow(b, unary()) }
+                  return b
+              }
+
+              private fun unary(): Double {
+                  if (peek() == '-') { i++; return -unary() }
+                  if (peek() == '+') { i++; return unary() }
+                  return atom()
+              }
+
+              private fun atom(): Double {
+                  if (s.startsWith("sqrt", i)) { i += 4; return Math.sqrt(atom()) }
+                  if (peek() == '(') {
+                      i++
+                      val v = expr()
+                      if (peek() != ')') throw IllegalArgumentException()
+                      i++
+                      return v
+                  }
+                  val st = i
+                  while (peek().isDigit() || peek() == '.') i++
+                  if (st == i) throw IllegalArgumentException()
+                  return s.substring(st, i).toDouble()
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var recognizer: DigitalInkRecognizer
+              private lateinit var drawing: DrawingView
+              private val handler = Handler(Looper.getMainLooper())
+              private var modelReady = false
+              private var textScale = 1.0f
+              private var mathMode = false   // false: words (Abc), true: digits and operators (123)
+              private var baseSize = 0f      // one text size for the whole board (set from first writing)
+              private var nextGroup = 1
+              private val measurePaint = Paint().apply { typeface = Typeface.SANS_SERIF }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  drawing = DrawingView(this)
+
+                  // ---- Toolbar ----
+                  fun tool(label: String) = Button(this).apply { text = label; isAllCaps = false }
+                  val modeBtn = tool("✏️ Pen")
+                  val mathBtn = tool("Abc")
+                  val minusBtn = tool("A−")
+                  val plusBtn = tool("A+")
+                  val scaleLabel = TextView(this).apply {
+                      text = "100%"; gravity = Gravity.CENTER; setPadding(dp(6), 0, dp(6), 0)
+                  }
+                  val saveBtn = tool("Save")
+                  val copyBtn = tool("Copy")
+                  val clearBtn = tool("Clear")
+
+                  val colors = listOf(
+                      Color.BLACK, 0xFFD32F2F.toInt(), 0xFF1976D2.toInt(),
+                      0xFF388E3C.toInt(), 0xFFF57C00.toInt()
+                  )
+                  val colorBtns = colors.map { c ->
+                      Button(this).apply {
+                          setBackgroundColor(c); setTextColor(Color.WHITE)
+                          minWidth = 0; minimumWidth = 0
+                          layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).also {
+                              it.setMargins(dp(4), dp(4), dp(4), dp(4))
+                          }
+                      }
+                  }
+                  fun refresh() {
+                      colorBtns.forEachIndexed { i, b -> b.text = if (colors[i] == drawing.penColor) "✓" else "" }
+                      modeBtn.text = if (drawing.eraser) "🧽 Eraser" else "✏️ Pen"
+                      mathBtn.text = if (mathMode) "123" else "Abc"
+                      scaleLabel.text = "${Math.round(textScale * 100)}%"
+                  }
+
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      addView(modeBtn)
+                      addView(mathBtn)
+                      colorBtns.forEach { addView(it) }
+                      addView(minusBtn); addView(scaleLabel); addView(plusBtn)
+                      addView(saveBtn); addView(copyBtn); addView(clearBtn)
+                  }
+                  val bar = HorizontalScrollView(this).apply {
+                      setBackgroundColor(0xEEFFFFFF.toInt()); addView(row)
+                  }
+                  val frame = FrameLayout(this).apply {
+                      addView(drawing, FrameLayout.LayoutParams(-1, -1))
+                      addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+                  }
+                  setContentView(frame)
+                  refresh()
+
+                  modeBtn.setOnClickListener { drawing.eraser = !drawing.eraser; refresh() }
+                  mathBtn.setOnClickListener { mathMode = !mathMode; refresh() }
+                  colors.forEachIndexed { i, c ->
+                      colorBtns[i].setOnClickListener {
+                          drawing.penColor = c; drawing.eraser = false; refresh()
+                      }
+                  }
+                  minusBtn.setOnClickListener { textScale = maxOf(0.5f, textScale - 0.1f); refresh() }
+                  plusBtn.setOnClickListener { textScale = minOf(3.0f, textScale + 0.1f); refresh() }
+                  clearBtn.setOnClickListener { drawing.clearAll(); baseSize = 0f }
+                  copyBtn.setOnClickListener {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("text", drawing.plainText()))
+                      Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                  }
+                  saveBtn.setOnClickListener {
+                      AlertDialog.Builder(this)
+                          .setTitle("Save")
+                          .setItems(arrayOf("Image (PNG)", "Text (.txt)")) { _, which ->
+                              if (which == 0) saveImage() else saveText()
+                          }.show()
+                  }
+
+                  // ---- Recognition ----
+                  setupRecognizer("en-US")
+                  drawing.onStrokeStarted = { handler.removeCallbacksAndMessages(null) }
+                  drawing.onStrokeFinished = {
+                      handler.removeCallbacksAndMessages(null)
+                      handler.postDelayed({ recognizeAndReplace() }, 800)
+                  }
+              }
+
+              // ---- Save (Android 10+; no storage permission needed) ----
+              private fun saveImage() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "board_${System.currentTimeMillis()}.png")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          drawing.toBitmap().compress(Bitmap.CompressFormat.PNG, 100, it)
+                      }
+                      Toast.makeText(this, "Gallery లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun saveText() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, "board_${System.currentTimeMillis()}.txt")
+                          put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          it.write(drawing.plainText().toByteArray(Charsets.UTF_8))
+                      }
+                      Toast.makeText(this, "Downloads లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              // First run downloads the model once (needs internet). After that: offline.
+              private fun setupRecognizer(tag: String) {
+                  val id = DigitalInkRecognitionModelIdentifier.fromLanguageTag(tag)!!
+                  val model = DigitalInkRecognitionModel.builder(id).build()
+                  recognizer = DigitalInkRecognition.getClient(
+                      DigitalInkRecognizerOptions.builder(model).build()
+                  )
+                  val manager = RemoteModelManager.getInstance()
+                  manager.isModelDownloaded(model).addOnSuccessListener { downloaded ->
+                      if (downloaded) { modelReady = true; return@addOnSuccessListener }
+                      Toast.makeText(this, "Model download అవుతోంది…", Toast.LENGTH_LONG).show()
+                      manager.download(model, DownloadConditions.Builder().build())
+                          .addOnSuccessListener {
+                              modelReady = true
+                              Toast.makeText(this, "సిద్ధం. వ్రాయండి!", Toast.LENGTH_SHORT).show()
+                          }
+                          .addOnFailureListener {
+                              Toast.makeText(this, "Download failed. Internet ఆన్ చేయండి.",
+                                  Toast.LENGTH_LONG).show()
+                          }
+                  }
+              }
+
+              // ================= Maths layout =================
+
+              // One written symbol (may have several strokes, e.g. "=" or "x")
+              private class Sym(var l: Float, var t: Float, var r: Float, var b: Float, val color: Int) {
+                  val strokes = mutableListOf<Ink.Stroke>()
+                  var text = ""
+                  var root = false   // a √ sign drawn with its top bar
+                  var flat = false   // a single long horizontal stroke (fraction bar or minus)
+                  var fixed: String? = null  // "+", "=", "-", "√" decided from the shape of the strokes
+                  val w get() = r - l
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  val cx get() = (l + r) / 2
+              }
+
+              // Layout element: a plain symbol, a fraction block, or a root block
+              private class El(
+                  val kind: Int,                      // 0 plain, 1 fraction, 2 root
+                  val sym: Sym,                       // the symbol / the bar / the √ sign
+                  val a: List<Sym> = emptyList(),     // numerator, or content under √
+                  val d: List<Sym> = emptyList()      // denominator
+              ) {
+                  var l = 0f; var t = 0f; var r = 0f; var b = 0f
+                  var sup = false
+                  var sub = false
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  init {
+                      val all = listOf(sym) + a + d
+                      l = all.minOf { it.l }; t = all.minOf { it.t }
+                      r = all.maxOf { it.r }; b = all.maxOf { it.b }
+                  }
+              }
+
+              private class Out {
+                  val items = mutableListOf<DrawingView.TextItem>()
+                  val lines = mutableListOf<DrawingView.LineItem>()
+                  val groups = HashMap<Int, DrawingView.Group>()
+              }
+
+              private class Res(
+                  val copy: String, val expr: String, val baseline: Float, val size: Float,
+                  val right: Float
+              )
+
+              // √ drawn as: small tick, down, up, long top bar, all in ONE stroke
+              private fun isRoot(st: Ink.Stroke, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val pts = st.points
+                  val w = r - l; val h = b - t
+                  if (pts.size < 8 || h < 20f || w < h * 0.9f) return false
+                  val first = pts.first(); val last = pts.last()
+                  if (first.x > l + 0.3f * w || first.y < t + 0.3f * h) return false
+                  if (last.x < l + 0.75f * w || last.y > t + 0.2f * h) return false
+                  val low = pts.maxByOrNull { it.y } ?: return false
+                  return low.x <= l + 0.45f * w
+              }
+
+              private fun canMerge(s: Sym, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val w2 = r - l
+                  val cx2 = (l + r) / 2
+                  val inside = if (w2 <= s.w) cx2 >= s.l - 5 && cx2 <= s.r + 5
+                  else s.cx >= l - 5 && s.cx <= r + 5
+                  if (!inside) return false
+                  val vo = minOf(s.b, b) - maxOf(s.t, t)
+                  val maxH = maxOf(s.h, b - t, 20f)
+                  if (vo <= 0 && -vo > 0.8f * maxH) return false
+                  // a long flat bar with a much narrower stroke away from it = fraction, not one symbol
+                  val wide = maxOf(s.w, w2); val narrow = minOf(s.w, w2)
+                  val wideH = if (s.w >= w2) s.h else (b - t)
+                  if (wide > 2.5f * maxOf(wideH, 10f) && narrow < 0.5f * wide && vo <= 0) return false
+                  return true
+              }
+
+              private fun bounds(st: Ink.Stroke): FloatArray {
+                  var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                  var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                  for (p in st.points) {
+                      l = minOf(l, p.x); r = maxOf(r, p.x); t = minOf(t, p.y); b = maxOf(b, p.y)
+                  }
+                  return floatArrayOf(l, t, r, b)
+              }
+
+              // "+" and "=" are recognised from their shape, because letter models often mistake them
+              private fun detectFixed(s: Sym): String? {
+                  if (s.root || s.strokes.size != 2) return null
+                  val a = bounds(s.strokes[0]); val b = bounds(s.strokes[1])
+                  val wa = a[2] - a[0]; val ha = a[3] - a[1]
+                  val wb = b[2] - b[0]; val hb = b[3] - b[1]
+                  val flatA = wa > 1.8f * maxOf(ha, 8f)
+                  val flatB = wb > 1.8f * maxOf(hb, 8f)
+                  if (flatA && flatB) {
+                      return if (minOf(wa, wb) / maxOf(wa, wb) > 0.5f) "=" else null
+                  }
+                  val hz: FloatArray; val vt: FloatArray
+                  if (flatA && hb > 1.8f * maxOf(wb, 8f)) { hz = a; vt = b }
+                  else if (flatB && ha > 1.8f * maxOf(wa, 8f)) { hz = b; vt = a }
+                  else return null
+                  val hw = hz[2] - hz[0]; val vh = vt[3] - vt[1]
+                  val fx = ((vt[0] + vt[2]) / 2 - hz[0]) / hw
+                  val fy = ((hz[1] + hz[3]) / 2 - vt[1]) / vh
+                  val ratio = hw / vh
+                  return if (fx in 0.3f..0.7f && fy in 0.35f..0.65f && ratio in 0.55f..1.8f) "+" else null
+              }
+
+              private fun groupSymbols(list: List<DrawingView.PStroke>): List<Sym> {
+                  val syms = mutableListOf<Sym>()
+                  for (ps in list) {
+                      var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                      var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                      for (p in ps.stroke.points) {
+                          l = minOf(l, p.x); r = maxOf(r, p.x)
+                          t = minOf(t, p.y); b = maxOf(b, p.y)
+                      }
+                      val rootStroke = isRoot(ps.stroke, l, t, r, b)
+                      val host = if (rootStroke) null
+                      else syms.firstOrNull { !it.root && canMerge(it, l, t, r, b) }
+                      if (host != null) {
+                          host.strokes.add(ps.stroke)
+                          host.l = minOf(host.l, l); host.r = maxOf(host.r, r)
+                          host.t = minOf(host.t, t); host.b = maxOf(host.b, b)
+                      } else {
+                          syms.add(Sym(l, t, r, b, ps.color).also {
+                              it.strokes.add(ps.stroke); it.root = rootStroke
+                          })
+                      }
+                  }
+                  for (s in syms) {
+                      s.flat = !s.root && s.strokes.size == 1 && s.w > 2f * maxOf(s.h, 10f)
+                      s.fixed = detectFixed(s)
+                  }
+                  return syms.sortedBy { it.l }
+              }
+
+              private fun tickWidth(s: Sym) = minOf(s.h * 0.55f, s.w * 0.4f)
+
+              // Find fractions and roots, and turn everything else into plain elements
+              private fun buildElements(syms: List<Sym>): List<El> {
+                  if (syms.isEmpty()) return emptyList()
+                  val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                  val refH = if (hs.isEmpty()) 40f else hs[hs.size / 2]
+                  val consumed = HashSet<Sym>()
+                  val blocks = mutableListOf<El>()
+                  for (c in syms.filter { it.root || it.flat }.sortedByDescending { it.w }) {
+                      if (c in consumed) continue
+                      if (c.root) {
+                          val tw = tickWidth(c)
+                          val inner = syms.filter {
+                              it !== c && it !in consumed && it.cx > c.l + tw - 5 && it.cx < c.r + 5 &&
+                                      it.cy > c.t && it.cy < c.b + c.h * 0.2f
+                          }
+                          if (inner.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(inner)
+                          blocks.add(El(2, c, inner))
+                      } else {
+                          val near = syms.filter {
+                              it !== c && it !in consumed && it.cx >= c.l - 5 && it.cx <= c.r + 5 &&
+                                      Math.abs(it.cy - c.cy) < 4 * refH
+                          }
+                          val num = near.filter { it.cy < c.cy }
+                          val den = near.filter { it.cy >= c.cy }
+                          if (num.isEmpty() || den.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(near)
+                          blocks.add(El(1, c, num, den))
+                      }
+                  }
+                  val plain = syms.filter { it !in consumed }.map {
+                      if (it.fixed == null && it.root) it.fixed = "√"
+                      if (it.fixed == null && it.flat) it.fixed = "-"
+                      El(0, it)
+                  }
+                  return (plain + blocks).sortedBy { it.l }
+              }
+
+              // Split elements into lines (powers sit above the line, so allow some margin)
+              private fun groupLines(els: List<El>): List<List<El>> {
+                  val lines = mutableListOf<MutableList<El>>()
+                  for (e in els) {
+                      val line = lines.firstOrNull { ln ->
+                          val t = ln.minOf { it.t }; val b = ln.maxOf { it.b }; val h = b - t
+                          e.cy >= t - 0.8f * h && e.cy <= b + 0.3f * h
+                      }
+                      if (line != null) line.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.sortedBy { ln -> ln.minOf { it.t } }
+              }
+
+              private fun addRootLines(s: Sym, out: Out) {
+                  val tw = tickWidth(s)
+                  val ax = s.l; val ay = s.t + 0.62f * s.h
+                  val bx = s.l + 0.22f * tw; val by = s.t + 0.55f * s.h
+                  val cx = s.l + 0.55f * tw; val cy = s.b
+                  val dx = s.l + tw; val dy = s.t
+                  out.lines.add(DrawingView.LineItem(ax, ay, bx, by, s.color))
+                  out.lines.add(DrawingView.LineItem(bx, by, cx, cy, s.color))
+                  out.lines.add(DrawingView.LineItem(cx, cy, dx, dy, s.color))
+                  out.lines.add(DrawingView.LineItem(dx, dy, s.r, dy, s.color))
+              }
+
+              // A group of consecutive symbols that is recognized together (context makes it accurate)
+              // digit = recognise symbol by symbol and prefer digits/operators (powers, 123 mode)
+              private class Seg(val syms: List<Sym>, val digit: Boolean) { var text = "" }
+
+              // kind 0 = text run, 1 = raised (power) run, 2 = fraction/root block,
+              // 3 = lowered (subscript) run, 4 = one symbol known from its shape (+ = - √)
+              private class Part(val kind: Int, val els: List<El>)
+
+              private var segMap: Map<Sym, Seg> = emptyMap()
+
+              // Decide which symbols are powers or subscripts, then cut the line into parts
+              private fun computeParts(els: List<El>): List<Part> {
+                  var base: El? = null
+                  var script: El? = null
+                  var scriptSup = false
+                  for (e in els) {
+                      e.sup = false; e.sub = false
+                      if (e.kind == 0) {
+                          val b = base; val u = script
+                          if (u != null && Math.abs(e.cy - u.cy) < u.h * 0.7f && e.l - u.r < u.h * 1.5f) {
+                              if (scriptSup) e.sup = true else e.sub = true
+                          } else if (b != null && e.l >= b.l && e.h >= b.h * 0.2f) {
+                              if (e.h <= b.h * 1.1f && e.b < b.t + b.h * 0.7f) e.sup = true
+                              else if (e.h <= b.h * 0.85f && e.t > b.t + b.h * 0.5f &&
+                                  e.b > b.b - b.h * 0.1f) e.sub = true
+                          }
+                          if (e.sup || e.sub) { script = e; scriptSup = e.sup } else { base = e; script = null }
+                      } else { base = e; script = null }
+                  }
+
+                  val parts = mutableListOf<Part>()
+                  var cur = mutableListOf<El>()
+                  var curKind = 0
+                  fun flush() {
+                      if (cur.isNotEmpty()) { parts.add(Part(curKind, cur)); cur = mutableListOf() }
+                  }
+                  for (e in els) {
+                      if (e.kind != 0) { flush(); parts.add(Part(2, listOf(e))); continue }
+                      val k = if (e.sup) 1 else if (e.sub) 3 else if (e.sym.fixed != null) 4 else 0
+                      if (k == 4) { flush(); parts.add(Part(4, listOf(e))); continue }
+                      if (cur.isNotEmpty() && k != curKind) flush()
+                      curKind = k
+                      cur.add(e)
+                  }
+                  flush()
+                  return parts
+              }
+
+              // Pass 1: list every group that must be sent to the recogniser
+              private fun collect(els: List<El>, segs: MutableList<Seg>, map: MutableMap<Sym, Seg>) {
+                  for (p in computeParts(els)) {
+                      when (p.kind) {
+                          2 -> {
+                              val e = p.els[0]
+                              collect(buildElements(e.a), segs, map)
+                              if (e.kind == 1) collect(buildElements(e.d), segs, map)
+                          }
+                          4 -> {}
+                          else -> {
+                              val seg = Seg(p.els.map { it.sym }, p.kind != 0 || mathMode)
+                              segs.add(seg)
+                              map[seg.syms[0]] = seg
+                          }
+                      }
+                  }
+              }
+
+              // Pass 3: draw one line. Every piece of text has the SAME size; powers and
+              // subscripts sit right after the text before them, raised or lowered.
+              private fun layoutLine(els: List<El>, parentSize: Float, out: Out): Res {
+                  if (els.isEmpty()) return Res("", "", 0f, 24f, 0f)
+                  val parts = computeParts(els)
+
+                  val normal = els.filter { !it.sup && !it.sub }
+                  val plainNormal = normal.filter { it.kind == 0 }
+                  val size = if (parentSize > 0f) parentSize else baseSize * textScale
+                  val ref = plainNormal.filter { it.sym.fixed == null }.ifEmpty { plainNormal }
+                  val baseline = if (ref.isNotEmpty())
+                      ref.map { it.b }.sorted()[ref.size / 2] else normal[0].cy
+
+                  val copy = StringBuilder()
+                  val expr = StringBuilder()
+                  var cursor = Float.NEGATIVE_INFINITY   // right edge of what is drawn so far
+                  for (p in parts) {
+                      val first = p.els[0]
+                      val color = first.sym.color
+                      when (p.kind) {
+                          0, 4 -> {
+                              val t = if (p.kind == 4) first.sym.fixed ?: ""
+                              else (segMap[first.sym]?.text ?: "").replace("\n", " ")
+                              if (t.isNotEmpty()) {
+                                  measurePaint.textSize = size
+                                  val w = measurePaint.measureText(t)
+                                  val l = p.els.minOf { it.l }
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) l
+                                  else maxOf(l, cursor + size * 0.12f)
+                                  out.items.add(DrawingView.TextItem(t, t, left + w / 2, baseline,
+                                      size, color, false))
+                                  cursor = left + w
+                              }
+                              copy.append(t); expr.append(t)
+                          }
+                          1, 3 -> {
+                              val isSup = p.kind == 1
+                              val t = segMap[first.sym]?.text ?: ""
+                              if (t.isNotEmpty()) {
+                                  val sz = size * 0.6f
+                                  measurePaint.textSize = sz
+                                  val w = measurePaint.measureText(t)
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) p.els.minOf { it.l }
+                                  else cursor + size * 0.03f
+                                  val y = if (isSup) baseline - size * 0.40f else baseline + size * 0.22f
+                                  out.items.add(DrawingView.TextItem(t, if (isSup) toSuper(t) else toSub(t),
+                                      left + w / 2, y, sz, color, true))
+                                  cursor = left + w
+                                  copy.append(if (isSup) toSuper(t) else toSub(t))
+                                  if (isSup) expr.append("^(").append(t).append(")")
+                              }
+                          }
+                          else -> {
+                              val s = first.sym
+                              if (first.kind == 1) {
+                                  out.lines.add(DrawingView.LineItem(s.l, s.cy, s.r, s.cy, s.color))
+                                  val n = layoutLine(buildElements(first.a), size * 0.85f, out)
+                                  val d = layoutLine(buildElements(first.d), size * 0.85f, out)
+                                  copy.append("(").append(n.copy).append(")/(").append(d.copy).append(")")
+                                  expr.append("((").append(n.expr).append(")/(").append(d.expr).append("))")
+                              } else {
+                                  addRootLines(s, out)
+                                  val inner = layoutLine(buildElements(first.a), size, out)
+                                  copy.append("√(").append(inner.copy).append(")")
+                                  expr.append("sqrt(").append(inner.expr).append(")")
+                              }
+                              cursor = maxOf(cursor, first.r)
+                          }
+                      }
+                  }
+                  return Res(copy.toString(), expr.toString(), baseline, size,
+                      if (cursor == Float.NEGATIVE_INFINITY) els.maxOf { it.r } else cursor)
+              }
+
+              private fun layoutAll(syms: List<Sym>): Out {
+                  val out = Out()
+                  // One text size for the whole board: taken from the first writing, then kept
+                  if (baseSize == 0f) {
+                      val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                      baseSize = if (hs.isEmpty()) 64f * resources.displayMetrics.density
+                      else (hs[hs.size / 2] / 0.72f).coerceIn(40f, 200f)
+                  }
+                  for (line in groupLines(buildElements(syms))) {
+                      val sorted = line.sortedBy { it.l }
+                      val i0 = out.items.size
+                      val l0 = out.lines.size
+                      val res = layoutLine(sorted, 0f, out)
+                      var copy = res.copy
+
+                      // "=" at the end: write the answer right after it
+                      if (copy.trimEnd().endsWith("=")) {
+                          val v = evaluate(res.expr)
+                          if (v != null) {
+                              val ans = formatNumber(v)
+                              measurePaint.textSize = res.size
+                              val w = measurePaint.measureText(ans)
+                              val cx = res.right + res.size * 0.3f + w / 2
+                              out.items.add(DrawingView.TextItem(ans, ans, cx, res.baseline,
+                                  res.size, 0xFF2E7D32.toInt(), false))
+                              copy = copy.trimEnd() + ans
+                          }
+                      }
+
+                      if (out.items.size == i0) continue
+                      val gid = nextGroup++
+                      var x0 = Float.MAX_VALUE
+                      for (k in i0 until out.items.size) {
+                          out.items[k].group = gid
+                          x0 = minOf(x0, out.items[k].cx)
+                      }
+                      for (k in l0 until out.lines.size) out.lines[k].group = gid
+                      out.groups[gid] = DrawingView.Group(copy, res.baseline, x0, res.size, out.items.size - i0)
+                  }
+                  return out
+              }
+
+              private fun evaluate(raw: String): Double? {
+                  var s = raw.replace(" ", "").trimEnd('=')
+                  s = s.replace('×', '*').replace('x', '*').replace('X', '*').replace('·', '*')
+                      .replace('÷', '/').replace('−', '-').replace('–', '-').replace('—', '-')
+                      .replace(',', '.')
+                  val check = s.replace("sqrt", "")
+                  if (s.isEmpty() || !check.all { it in "0123456789+-*/^()." }) return null
+                  return try {
+                      val v = Parser(s).parse()
+                      if (v.isNaN() || v.isInfinite()) null else v
+                  } catch (e: Exception) { null }
+              }
+
+              private fun formatNumber(v: Double): String {
+                  if (Math.abs(v - Math.rint(v)) < 1e-9 && Math.abs(v) < 1e15)
+                      return Math.rint(v).toLong().toString()
+                  return String.format(java.util.Locale.US, "%.4f", v).trimEnd('0').trimEnd('.')
+              }
+
+              // ================= Recognition =================
+
+              private class Task(val ink: Ink, val digit: Boolean, val set: (String) -> Unit)
+
+              // For digits/operators: among the best guesses take the first digit or operator
+              private fun pickDigit(cands: List<String>): String {
+                  val allowed = "0123456789+-−×÷=()./,"
+                  for (c in cands.take(5)) if (c.length == 1 && c[0] in allowed) return c
+                  return cands.firstOrNull() ?: "?"
+              }
+
+              private fun recognizeAndReplace() {
+                  if (!modelReady) return
+                  val snapshot = drawing.pending.toList()
+                  if (snapshot.isEmpty()) return
+                  val syms = groupSymbols(snapshot)
+
+                  // Keep the writing order of strokes (the recogniser reads them in order)
+                  val order = java.util.IdentityHashMap<Ink.Stroke, Int>()
+                  snapshot.forEachIndexed { i, ps -> order[ps.stroke] = i }
+                  fun inkOf(strokes: List<Ink.Stroke>): Ink {
+                      val b = Ink.builder()
+                      strokes.sortedBy { order[it] ?: 0 }.forEach { b.addStroke(it) }
+                      return b.build()
+                  }
+
+                  val segs = mutableListOf<Seg>()
+                  val map = HashMap<Sym, Seg>()
+                  for (line in groupLines(buildElements(syms))) collect(line.sortedBy { it.l }, segs, map)
+
+                  val tasks = mutableListOf<Task>()
+                  for (seg in segs) {
+                      if (seg.digit) {
+                          for (s in seg.syms) {
+                              val f = s.fixed
+                              if (f != null) s.text = f
+                              else tasks.add(Task(inkOf(s.strokes), true) { t -> s.text = t })
+                          }
+                      } else {
+                          tasks.add(Task(inkOf(seg.syms.flatMap { it.strokes }), false) { t -> seg.text = t })
+                      }
+                  }
+                  if (tasks.isEmpty()) { finish(snapshot, syms, segs, map); return }
+
+                  var remaining = tasks.size
+                  for (task in tasks) {
+                      recognizer.recognize(task.ink)
+                          .addOnSuccessListener { r ->
+                              val c = r.candidates.map { it.text }
+                              task.set(if (task.digit) pickDigit(c) else c.firstOrNull() ?: "")
+                          }
+                          .addOnFailureListener { task.set("?") }
+                          .addOnCompleteListener {
+                              remaining--
+                              if (remaining == 0) finish(snapshot, syms, segs, map)
+                          }
+                  }
+              }
+
+              private fun finish(
+                  snapshot: List<DrawingView.PStroke>, syms: List<Sym>,
+                  segs: List<Seg>, map: Map<Sym, Seg>
+              ) {
+                  for (seg in segs) if (seg.digit) seg.text = seg.syms.joinToString("") { it.text }
+                  segMap = map
+                  val out = layoutAll(syms)
+                  drawing.commit(snapshot, out.items, out.lines, out.groups)
+              }
+
+              // For Copy/Save text only: x² style characters
+              private val supMap = mapOf(
+                  '0' to '⁰', '1' to '¹', '2' to '²', '3' to '³', '4' to '⁴',
+                  '5' to '⁵', '6' to '⁶', '7' to '⁷', '8' to '⁸', '9' to '⁹',
+                  '+' to '⁺', '-' to '⁻', 'n' to 'ⁿ', 'i' to 'ⁱ', 'x' to 'ˣ'
+              )
+
+              private fun toSuper(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(supMap[c] ?: return "^($t)")
+                  return sb.toString()
+              }
+
+              private val subMap = mapOf(
+                  '0' to '₀', '1' to '₁', '2' to '₂', '3' to '₃', '4' to '₄',
+                  '5' to '₅', '6' to '₆', '7' to '₇', '8' to '₈', '9' to '₉',
+                  '+' to '₊', '-' to '₋', 'n' to 'ₙ', 'x' to 'ₓ'
+              )
+
+              private fun toSub(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(subMap[c] ?: return "_($t)")
+                  return sb.toString()
+              }
+
+              override fun onDestroy() { recognizer.close(); super.onDestroy() }
+          }
+          EOF_INK
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InkToText-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
